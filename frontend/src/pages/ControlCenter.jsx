@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
+import "leaflet.heat";
 
 const redIcon = new L.Icon({
   iconUrl: "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png",
@@ -77,6 +78,79 @@ function MapFlyto({ incidents }) {
   return null;
 }
 
+function severityToWeight(severity) {
+  const normalized = String(severity || "").toLowerCase();
+  if (normalized === "high" || normalized === "critical") return 1.0;
+  if (normalized === "medium") return 0.65;
+  return 0.35;
+}
+
+function distanceInKm(lat1, lon1, lat2, lon2) {
+  const toRadians = (deg) => (deg * Math.PI) / 180;
+  const earthRadiusKm = 6371;
+
+  const dLat = toRadians(lat2 - lat1);
+  const dLon = toRadians(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+}
+
+function IncidentHeatLayer({ incidents, clusteredIncidentIds }) {
+  const map = useMap();
+  const heatLayerRef = useRef(null);
+
+  useEffect(() => {
+    if (heatLayerRef.current) {
+      map.removeLayer(heatLayerRef.current);
+      heatLayerRef.current = null;
+    }
+
+    const heatPoints = incidents
+      .filter((incident) => Number.isFinite(incident.latitude) && Number.isFinite(incident.longitude))
+      .map((incident) => {
+        const priorityWeight = Number(incident.priorityScore);
+        const severityWeight = severityToWeight(incident.severity);
+        const baseWeight = Number.isFinite(priorityWeight) && priorityWeight > 0
+          ? Math.max(0.15, Math.min(1, priorityWeight))
+          : severityWeight;
+        const clusteredBoost = clusteredIncidentIds.has(incident.id) ? 1.35 : 1;
+        const weight = Math.max(0.15, Math.min(1.5, baseWeight * clusteredBoost));
+
+        return [incident.latitude, incident.longitude, weight];
+      });
+
+    if (heatPoints.length === 0) {
+      return;
+    }
+
+    heatLayerRef.current = L.heatLayer(heatPoints, {
+      radius: 32,
+      blur: 20,
+      maxZoom: 17,
+      minOpacity: 0.35,
+      gradient: {
+        0.25: "#2d8cff",
+        0.45: "#14b8a6",
+        0.7: "#f59e0b",
+        1.0: "#ef4444",
+      },
+    }).addTo(map);
+
+    return () => {
+      if (heatLayerRef.current) {
+        map.removeLayer(heatLayerRef.current);
+        heatLayerRef.current = null;
+      }
+    };
+  }, [incidents, map, clusteredIncidentIds]);
+
+  return null;
+}
+
 function AnimatedNumber({ value, duration = 700 }) {
   const [displayValue, setDisplayValue] = useState(value);
   const rafRef = useRef(0);
@@ -126,6 +200,82 @@ function StatCard({ label, value, accent, tag, pulse }) {
 function ControlCenter() {
   const [incidents, setIncidents] = useState([]);
 
+  const {
+    clusteredIncidentIds,
+    dangerZones,
+  } = useMemo(() => {
+    const validIncidents = incidents.filter(
+      (incident) => Number.isFinite(incident.latitude) && Number.isFinite(incident.longitude)
+    );
+
+    const radiusKm = 1.2;
+    const minClusterSizeForDangerZone = 4;
+    const adjacency = new Map();
+
+    validIncidents.forEach((incident) => {
+      adjacency.set(incident.id, []);
+    });
+
+    for (let i = 0; i < validIncidents.length; i += 1) {
+      for (let j = i + 1; j < validIncidents.length; j += 1) {
+        const a = validIncidents[i];
+        const b = validIncidents[j];
+        const distanceKm = distanceInKm(a.latitude, a.longitude, b.latitude, b.longitude);
+
+        if (distanceKm <= radiusKm) {
+          adjacency.get(a.id).push(b.id);
+          adjacency.get(b.id).push(a.id);
+        }
+      }
+    }
+
+    const visited = new Set();
+    const nextClusters = [];
+
+    validIncidents.forEach((incident) => {
+      if (visited.has(incident.id)) {
+        return;
+      }
+
+      const queue = [incident.id];
+      visited.add(incident.id);
+      const clusterIds = [];
+
+      while (queue.length > 0) {
+        const currentId = queue.shift();
+        clusterIds.push(currentId);
+
+        const neighbors = adjacency.get(currentId) || [];
+        neighbors.forEach((neighborId) => {
+          if (!visited.has(neighborId)) {
+            visited.add(neighborId);
+            queue.push(neighborId);
+          }
+        });
+      }
+
+      const members = validIncidents.filter((item) => clusterIds.includes(item.id));
+      if (members.length > 0) {
+        const centerLat = members.reduce((sum, item) => sum + item.latitude, 0) / members.length;
+        const centerLng = members.reduce((sum, item) => sum + item.longitude, 0) / members.length;
+        nextClusters.push({
+          ids: clusterIds,
+          size: members.length,
+          centerLat,
+          centerLng,
+        });
+      }
+    });
+
+    const nextDangerZones = nextClusters.filter((cluster) => cluster.size >= minClusterSizeForDangerZone);
+    const nextClusteredIds = new Set(nextDangerZones.flatMap((cluster) => cluster.ids));
+
+    return {
+      clusteredIncidentIds: nextClusteredIds,
+      dangerZones: nextDangerZones,
+    };
+  }, [incidents]);
+
   useEffect(() => {
     // Fetch existing incidents from backend
     fetch("http://127.0.0.1:8000/incidents")
@@ -140,6 +290,7 @@ function ControlCenter() {
           longitude: Number(incident.longitude),
           severity: incident.severity,
           riskScore: Number(incident.risk_score) || 0,
+          priorityScore: Number(incident.priority_score) || 0,
           estimatedResponseTime: Number(incident.estimated_response_time) || 15,
         }));
         console.log("Formatted incidents:", formattedIncidents);
@@ -154,17 +305,19 @@ function ControlCenter() {
       const data = JSON.parse(event.data);
 
       if (data.type === "new_incident") {
+        const incidentPayload = data.incident ?? data;
         setIncidents((prev) => [
           ...prev,
           {
-            id: data.incident_id,
-            description: data.description,
+            id: incidentPayload.id ?? data.incident_id,
+            description: incidentPayload.description,
             status: "pending",
-            latitude: Number(data.latitude),
-            longitude: Number(data.longitude),
-            severity: data.severity,
-            riskScore: Number(data.risk_score) || 0,
-            estimatedResponseTime: Number(data.estimated_response_time) || 15,
+            latitude: Number(incidentPayload.latitude),
+            longitude: Number(incidentPayload.longitude),
+            severity: incidentPayload.severity,
+            riskScore: Number(incidentPayload.risk_score) || 0,
+            priorityScore: Number(incidentPayload.priority_score) || Number(data.priority_score) || 0,
+            estimatedResponseTime: Number(incidentPayload.estimated_response_time) || 15,
           },
         ]);
       }
@@ -205,7 +358,10 @@ function ControlCenter() {
       pendingCount: incidents.filter((i) => i.status === "pending").length,
       inProgressCount: incidents.filter((i) => i.status === "in_progress").length,
       resolvedCount: incidents.filter((i) => i.status === "resolved").length,
-      highSeverityCount: incidents.filter((i) => i.severity === "high").length,
+      highSeverityCount: incidents.filter((i) => {
+        const normalizedSeverity = String(i.severity || "").toLowerCase();
+        return normalizedSeverity === "high" || normalizedSeverity === "critical";
+      }).length,
     };
   }, [incidents]);
 
@@ -235,6 +391,24 @@ function ControlCenter() {
             </div>
           </div>
 
+          {dangerZones.length > 0 && (
+            <div
+              style={{
+                margin: "0 16px 10px",
+                padding: "10px 14px",
+                borderRadius: "8px",
+                border: "1px solid rgba(255, 76, 76, 0.7)",
+                background: "rgba(255, 76, 76, 0.14)",
+                color: "#ff9a9a",
+                fontWeight: 700,
+                letterSpacing: "0.2px",
+              }}
+            >
+              High Incident Density Area
+              {` (${dangerZones.length} zone${dangerZones.length > 1 ? "s" : ""} detected)`}
+            </div>
+          )}
+
           <div className="map-shell">
             <MapContainer
               center={[28.6139, 77.209]}
@@ -245,6 +419,7 @@ function ControlCenter() {
             >
               <MapSizeFix />
               <MapFlyto incidents={incidents} />
+              <IncidentHeatLayer incidents={incidents} clusteredIncidentIds={clusteredIncidentIds} />
               <TileLayer
                 attribution='&copy; OpenStreetMap contributors'
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"

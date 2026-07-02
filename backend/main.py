@@ -31,16 +31,25 @@ def save_incidents(data):
 from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from fastapi import WebSocket, WebSocketDisconnect
 from typing import List
 import asyncio
 from datetime import datetime, timedelta
+import logging
 from google import genai
 import os
+from dotenv import load_dotenv
 
-from ai_utils import calculate_risk_score_and_response_time
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
+from ai_utils import calculate_risk_score_and_response_time, predict_severity as predict_crisis_severity, extract_severity, analyze_description, predict_resolution_time, send_email_alert, send_sms_alert
 
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("crisischain.alerts")
 
 def predict_severity(description: str):
     response = client.models.generate_content(
@@ -123,6 +132,16 @@ def auto_assign_responder(db: Session, incident):
 import models
 from database import Base, SessionLocal, engine
 
+
+def ensure_incident_priority_column():
+    """Add incidents.priority_score column if it does not exist (SQLite-safe migration)."""
+    with engine.connect() as conn:
+        result = conn.execute(text("PRAGMA table_info(incidents);"))
+        columns = {row[1] for row in result.fetchall()}
+        if "priority_score" not in columns:
+            conn.execute(text("ALTER TABLE incidents ADD COLUMN priority_score FLOAT NOT NULL DEFAULT 0.0;"))
+            conn.commit()
+
 def get_db():
     db = SessionLocal()
     try:
@@ -133,10 +152,7 @@ def get_db():
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
-
-@app.get("/")
-def read_root():
-    return {"message": "CrisisChain Backend Running 🚀"}
+ensure_incident_priority_column()
 
 
 class UserCreate(BaseModel):
@@ -150,6 +166,22 @@ class IncidentCreate(BaseModel):
     category: str
     latitude: float
     longitude: float
+    severity: str | None = None
+
+class SeverityPredictionRequest(BaseModel):
+    type: str
+    location_type: str
+    people_affected: int
+    time_of_day: str
+
+class AnalyzeDescriptionRequest(BaseModel):
+    text: str
+
+class ResolutionTimePredictionRequest(BaseModel):
+    type: str
+    severity: str
+    people_affected: int
+    location_type: str
 
 class IncidentResponse(BaseModel):
     id: int
@@ -160,13 +192,132 @@ class IncidentResponse(BaseModel):
     longitude: float
     status: str
     risk_score: float
+    priority_score: float
     escalation_risk: float
     is_likely_to_escalate: bool
+    eta: int
     estimated_response_time: int
 
     class Config:
         orm_mode = True
-   
+
+
+@app.get("/")
+def read_root():
+    return {"message": "CrisisChain Backend Running 🚀"}
+
+
+@app.post("/predict-severity")
+def predict_severity_endpoint(payload: SeverityPredictionRequest):
+    """
+    Predict crisis severity based on incident characteristics.
+    
+    Input fields:
+    - type: Incident type (e.g., 'fire', 'medical', 'accident')
+    - location_type: 'urban' or 'rural'
+    - people_affected: Number of people affected (int)
+    - time_of_day: 'day' or 'night'
+    
+    Returns: JSON with predicted severity ('LOW', 'MEDIUM', 'HIGH')
+    """
+    try:
+        # Prepare input for the ML model
+        input_data = {
+            'incident_type': payload.type,
+            'location_type': payload.location_type,
+            'people_affected': payload.people_affected,
+            'time_of_day': payload.time_of_day
+        }
+        
+        # Call the predict_severity function from ai_utils
+        severity = predict_crisis_severity(input_data)
+        
+        # Validate and normalize severity (handles dict/invalid types)
+        validated_severity = extract_severity(severity)
+        # Convert to uppercase for consistency with ML output
+        validated_severity = validated_severity.upper()
+        
+        return {
+            "severity": validated_severity,
+            "input": {
+                "type": payload.type,
+                "location_type": payload.location_type,
+                "people_affected": payload.people_affected,
+                "time_of_day": payload.time_of_day
+            }
+        }
+    except Exception as e:
+        print(f"Error in predict_severity_endpoint: {e}")
+        return {
+            "error": str(e),
+            "severity": "HIGH"  # Default to HIGH on error
+        }
+
+
+@app.post("/analyze-description")
+def analyze_description_endpoint(payload: AnalyzeDescriptionRequest):
+    """
+    Analyze free-text incident description and extract inferred incident type
+    and people affected count.
+
+    Input fields:
+    - text: Incident description text
+
+    Returns:
+    - type: detected incident type
+    - people_affected: extracted people affected count
+    """
+    try:
+        result = analyze_description(payload.text)
+        return {
+            "type": result.get("type", "accident"),
+            "people_affected": int(result.get("people_affected", 1)),
+        }
+    except Exception as e:
+        print(f"Error in analyze_description_endpoint: {e}")
+        return {
+            "type": "accident",
+            "people_affected": 1,
+            "error": str(e),
+        }
+
+
+@app.post("/predict-resolution-time")
+def predict_resolution_time_endpoint(payload: ResolutionTimePredictionRequest):
+    """
+    Predict incident resolution time (minutes) from structured incident features.
+
+    Input fields:
+    - type: incident type
+    - severity: LOW / MEDIUM / HIGH
+    - people_affected: integer
+    - location_type: urban / rural
+
+    Returns:
+    - estimated_time_minutes: predicted resolution time in minutes
+    """
+    try:
+        estimated_minutes = predict_resolution_time({
+            "incident_type": payload.type,
+            "severity": payload.severity,
+            "people_affected": payload.people_affected,
+            "location_type": payload.location_type,
+        })
+        return {
+            "estimated_time_minutes": int(estimated_minutes),
+            "input": {
+                "type": payload.type,
+                "severity": payload.severity,
+                "people_affected": payload.people_affected,
+                "location_type": payload.location_type,
+            }
+        }
+    except Exception as e:
+        print(f"Error in predict_resolution_time_endpoint: {e}")
+        return {
+            "estimated_time_minutes": 45,
+            "error": str(e),
+        }
 
 
 @app.post("/register-user")
@@ -186,25 +337,96 @@ def register_user(payload: UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/create-incident")
 async def create_incident(payload: IncidentCreate, db: Session = Depends(get_db)):
-    try:
-        ai_severity = predict_severity(payload.description)
-    except Exception as e:
-        print("AI failed, using default severity:", e)
-        ai_severity = "high"  # fallback
+    # Use severity from request body when provided. If missing/empty, fallback to LOW.
+    ai_severity_raw = payload.severity
+    if ai_severity_raw is None or str(ai_severity_raw).strip() == "":
+        ai_severity_raw = "LOW"
 
-    # Calculate AI-based risk score and response time
-    risk_score, response_time = calculate_risk_score_and_response_time(
+    # Validate and normalize severity (handles dict/invalid types)
+    ai_severity = extract_severity(ai_severity_raw)
+
+    # Calculate AI-based risk score
+    risk_score, _ = calculate_risk_score_and_response_time(
         payload.description,
         payload.category,
         ai_severity
     )
+
+    # Estimate incident context from description for downstream predictions.
+    description_analysis = analyze_description(payload.description)
+    people_affected = max(0, int(description_analysis.get("people_affected", 1)))
+    location_type = "urban"
+
+    # Predict ETA (resolution time in minutes) using the regression model.
+    eta_minutes = predict_resolution_time({
+        "incident_type": payload.category,
+        "severity": ai_severity.upper(),
+        "people_affected": people_affected,
+        "location_type": location_type,
+    })
+
     escalation_risk, is_likely_to_escalate = predict_escalation(risk_score, ai_severity)
-    priority_score = (
-        risk_score * 0.6 +
-        escalation_risk * 0.3 +
-        (0.1 if is_likely_to_escalate else 0)
+    priority_score = calculate_priority(
+        ai_severity,
+        risk_score,
+        people_affected=people_affected,
+        time_elapsed_minutes=0,
     )
-    priority_score = round(priority_score, 2)
+
+    # Trigger alerts for critical incidents.
+    alert_trigger_reasons = []
+    if priority_score > 0.8:
+        alert_trigger_reasons.append(f"priority_score({priority_score}) > 0.8")
+    if ai_severity.upper() == "HIGH":
+        alert_trigger_reasons.append("severity == HIGH")
+
+    if alert_trigger_reasons:
+        incident_context = {
+            "description": payload.description,
+            "category": payload.category,
+            "severity": ai_severity.upper(),
+            "priority_score": round(priority_score, 2),
+            "risk_score": round(risk_score, 2),
+            "people_affected": people_affected,
+            "latitude": payload.latitude,
+            "longitude": payload.longitude,
+            "eta_minutes": eta_minutes,
+        }
+
+        logger.info(
+            "ALERT_TRIGGERED | reasons=%s | incident=%s",
+            "; ".join(alert_trigger_reasons),
+            json.dumps(incident_context),
+        )
+
+        incident_alert_message = (
+            f"Incident Alert\n"
+            f"Description: {payload.description}\n"
+            f"Category: {payload.category}\n"
+            f"Severity: {ai_severity.upper()}\n"
+            f"Priority Score: {priority_score}\n"
+            f"Risk Score: {round(risk_score, 2)}\n"
+            f"People Affected: {people_affected}\n"
+            f"Location: ({payload.latitude}, {payload.longitude})\n"
+            f"ETA (minutes): {eta_minutes}"
+        )
+
+        alert_to_email = os.getenv("ALERT_TO_EMAIL") or os.getenv("EMAIL_TO")
+        email_sent = send_email_alert(
+            alert_to_email,
+            f"CrisisChain Incident Alert - {ai_severity.upper()}",
+            incident_alert_message,
+        )
+        sms_sent = send_sms_alert(incident_alert_message)
+
+        if email_sent and sms_sent:
+            logger.info("ALERT_DISPATCH_RESULT | email_sent=True | sms_sent=True")
+        elif email_sent and not sms_sent:
+            logger.warning("ALERT_DISPATCH_RESULT | email_sent=True | sms_sent=False | status=partial_failure")
+        elif not email_sent and sms_sent:
+            logger.warning("ALERT_DISPATCH_RESULT | email_sent=False | sms_sent=True | status=partial_failure")
+        else:
+            logger.error("ALERT_DISPATCH_RESULT | email_sent=False | sms_sent=False | status=failed")
 
     # Set escalation deadline
     now = datetime.utcnow()
@@ -222,10 +444,11 @@ async def create_incident(payload: IncidentCreate, db: Session = Depends(get_db)
         longitude=payload.longitude,
         status="pending",
         risk_score=risk_score,
+        priority_score=priority_score,
         escalation_risk=escalation_risk,
         is_likely_to_escalate=is_likely_to_escalate,
         escalation_deadline=escalation_deadline,
-        estimated_response_time=response_time
+        estimated_response_time=eta_minutes
     )
 
     db.add(new_incident)
@@ -236,7 +459,6 @@ async def create_incident(payload: IncidentCreate, db: Session = Depends(get_db)
     if assigned_responder:
         db.commit()
         db.refresh(new_incident)
-    new_incident.priority_score = priority_score
 
     # Fetch responders
     responders = db.query(models.User).filter(models.User.role == "responder").all()
@@ -290,6 +512,7 @@ async def create_incident(payload: IncidentCreate, db: Session = Depends(get_db)
         "escalation_risk": round(new_incident.escalation_risk, 2),
         "is_likely_to_escalate": new_incident.is_likely_to_escalate,
         "priority_score": round(priority_score, 2),
+        "eta": new_incident.estimated_response_time,
         "estimated_response_time": new_incident.estimated_response_time,
         "escalation_seconds_remaining": escalation_seconds_remaining,
         "created_at": new_incident.created_at.isoformat() if new_incident.created_at else None
@@ -307,7 +530,8 @@ async def create_incident(payload: IncidentCreate, db: Session = Depends(get_db)
         "message": "Incident created",
         "incident_id": new_incident.id,
         "risk_score": round(risk_score, 2),
-        "estimated_response_time": response_time,
+        "eta": eta_minutes,
+        "estimated_response_time": eta_minutes,
         "assigned_responders": top_responders
     }
 
@@ -331,6 +555,94 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+
+def escalate_severity(severity):
+    # Validate and normalize severity
+    normalized_severity = extract_severity(severity)
+    
+    severity_order = ["low", "medium", "high", "critical"]
+    if normalized_severity not in severity_order:
+        return "critical"
+
+    current_index = severity_order.index(normalized_severity)
+    next_index = min(current_index + 1, len(severity_order) - 1)
+    return severity_order[next_index]
+
+
+async def escalation_monitor():
+    while True:
+        db = SessionLocal()
+        try:
+            now = datetime.utcnow()
+            incidents = db.query(models.Incident).filter(
+                models.Incident.escalation_deadline.isnot(None),
+                models.Incident.escalation_deadline <= now,
+                models.Incident.status != "resolved",
+                models.Incident.status != "escalated"
+            ).all()
+
+            for incident in incidents:
+                new_severity = escalate_severity(incident.severity)
+                escalation_risk, is_likely_to_escalate = predict_escalation(
+                    incident.risk_score,
+                    new_severity
+                )
+                elapsed_minutes = 0
+                if incident.created_at:
+                    elapsed_minutes = max(
+                        0,
+                        int((datetime.utcnow() - incident.created_at).total_seconds() / 60),
+                    )
+                priority_score = calculate_priority(
+                    new_severity,
+                    incident.risk_score,
+                    people_affected=1,
+                    time_elapsed_minutes=elapsed_minutes,
+                )
+
+                incident.status = "escalated"
+                incident.severity = new_severity
+                incident.priority_score = priority_score
+                incident.escalation_risk = escalation_risk
+                incident.is_likely_to_escalate = is_likely_to_escalate
+                incident.escalation_deadline = None
+
+                db.commit()
+                db.refresh(incident)
+
+                incident_payload = {
+                    "id": incident.id,
+                    "description": incident.description,
+                    "category": incident.category,
+                    "severity": incident.severity,
+                    "latitude": incident.latitude,
+                    "longitude": incident.longitude,
+                    "status": incident.status,
+                    "risk_score": round(incident.risk_score, 2),
+                    "escalation_risk": round(incident.escalation_risk, 2),
+                    "is_likely_to_escalate": incident.is_likely_to_escalate,
+                    "priority_score": priority_score,
+                    "eta": incident.estimated_response_time,
+                    "estimated_response_time": incident.estimated_response_time,
+                    "escalation_seconds_remaining": 0,
+                    "created_at": incident.created_at.isoformat() if incident.created_at else None
+                }
+
+                await manager.broadcast({
+                    "type": "incident_escalated",
+                    "incident": incident_payload
+                })
+        except Exception as e:
+            print("Escalation monitor error:", e)
+        finally:
+            db.close()
+
+        await asyncio.sleep(1)
+
+
+@app.on_event("startup")
+async def start_escalation_monitor():
+    asyncio.create_task(escalation_monitor())
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -416,13 +728,18 @@ def get_incidents(db: Session = Depends(get_db)):
             "longitude": i.longitude,
             "status": i.status,
             "risk_score": i.risk_score,
+            "priority_score": i.priority_score,
             "escalation_risk": i.escalation_risk,
             "is_likely_to_escalate": i.is_likely_to_escalate,
+            "eta": i.estimated_response_time,
             "estimated_response_time": i.estimated_response_time,
         }
         for i in incidents
     ]
 def predict_escalation(risk_score, severity):
+    # Validate and normalize severity
+    normalized_severity = extract_severity(severity)
+    
     severity_weight = {
         "low": 0.2,
         "medium": 0.4,
@@ -430,8 +747,46 @@ def predict_escalation(risk_score, severity):
         "critical": 0.9
     }
 
-    escalation_score = (risk_score * 0.7) + severity_weight.get(severity, 0.5)
+    escalation_score = (risk_score * 0.7) + severity_weight.get(normalized_severity, 0.5)
 
     return escalation_score, escalation_score > 1.0
+
+
+def calculate_priority(severity, risk_score, people_affected, time_elapsed_minutes):
+    """
+    Calculate a normalized priority score between 0 and 1.
+
+    Args:
+        severity: Severity label (LOW, MEDIUM, HIGH)
+        risk_score: Risk score as float (expected 0-1)
+        people_affected: Number of affected people
+        time_elapsed_minutes: Time elapsed since incident creation in minutes
+
+    Returns:
+        float: Priority score in range [0.0, 1.0]
+    """
+    normalized_severity = extract_severity(severity)
+    severity_numeric = {
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+        "critical": 3,
+    }.get(normalized_severity, 1)
+
+    # LOW=1, MEDIUM=2, HIGH=3 mapped to 0-1
+    severity_norm = (severity_numeric - 1) / 2
+    risk_norm = max(0.0, min(1.0, float(risk_score)))
+
+    # Normalize people/time with practical caps
+    people_norm = max(0.0, min(1.0, float(people_affected) / 500.0))
+    time_norm = max(0.0, min(1.0, float(time_elapsed_minutes) / 120.0))
+
+    score = (
+        severity_norm * 0.35
+        + risk_norm * 0.40
+        + people_norm * 0.15
+        + time_norm * 0.10
+    )
+    return round(max(0.0, min(1.0, score)), 2)
 
 

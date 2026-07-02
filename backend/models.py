@@ -30,6 +30,7 @@ class Incident(Base):
 	status = Column(String, default="pending", nullable=False)
 	assigned_responder_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 	risk_score = Column(Float, default=0.0, nullable=False)
+	priority_score = Column(Float, default=0.0, nullable=False)
 	escalation_risk = Column(Float, default=0.0, nullable=False)
 	is_likely_to_escalate = Column(Boolean, default=False, nullable=False)
 	escalation_deadline = Column(DateTime(timezone=True), nullable=True)

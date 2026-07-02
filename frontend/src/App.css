@@ -926,6 +926,32 @@ body {
   backdrop-filter: blur(8px);
 }
 
+.escalation-timer {
+  font-weight: 600;
+  margin-top: 8px;
+}
+
+.escalation-warning {
+  color: #ff9800;
+}
+
+.escalation-critical {
+  color: #ff3b3b;
+  animation: pulseDanger 1s infinite;
+}
+
+@keyframes pulseDanger {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
 @keyframes critical-bounce {
   0% {
     transform: scale(1);
