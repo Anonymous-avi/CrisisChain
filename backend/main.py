@@ -790,3 +790,10 @@ def calculate_priority(severity, risk_score, people_affected, time_elapsed_minut
     return round(max(0.0, min(1.0, score)), 2)
 
 
+@app.get("/healthz")
+def health_check():
+        return {
+        "status": "healthy",
+        "message": "CrisisChain Backend is running 🚀"
+    }
+
